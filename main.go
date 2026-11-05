@@ -1,4 +1,4 @@
-// Find GitHub username candidates; this program never creates or changes accounts.
+// Find username candidates, with an explicit opt-in GitHub rename mode.
 // A null lookup is only a candidate, not proof that GitHub permits registration.
 package main
 
@@ -57,8 +57,11 @@ type githubClient struct {
 }
 
 func main() {
-	length := flag.Int("length", 3, "username length: 3 or 4")
+	platform := flag.String("platform", "github", "platform to check: github or discord")
+	length := flag.Int("length", 3, "generated username length (GitHub: 3-4; Discord: 2-4)")
 	digits := flag.Bool("digits", false, "include digits in addition to a-z")
+	symbols := flag.Bool("symbols", false, "include _ and . in generated Discord names")
+	delay := flag.Duration("delay", time.Second, "Discord pause between request starts (at least 1s)")
 	n := flag.Int("n", 1000, "maximum names to check (normally new names; 0 = all remaining)")
 	seed := flag.Int64("seed", 1, "deterministic shuffle seed; keep unchanged to resume")
 	batch := flag.Int("batch", 100, "names per GraphQL request (1-100)")
@@ -69,14 +72,17 @@ func main() {
 	find := flag.Int("find", 0, "verify candidates as discovered and stop after this many available names")
 	liveVerify := flag.Bool("live-verify", false, "verify all candidates while discovery continues")
 	fresh := flag.Bool("fresh", false, "recheck saved observations, appending fresh results without truncating history")
+	claim := flag.Bool("claim", false, "GitHub only: rename the specified account to the first verified available name, then stop")
+	claimCookies := flag.String("claim-cookies", "", "cookie file for the explicitly enabled GitHub rename session")
+	claimAccount := flag.String("claim-account", "", "expected current GitHub login; required with -claim")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	quiet := flag.Bool("quiet", false, "suppress progress output; errors remain visible")
 	noColor := flag.Bool("no-color", false, "disable terminal colors (also respects NO_COLOR)")
 	verifyOut := flag.String("verify-out", "verified.jsonl", "append-only JSONL verification results")
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "hunt - find three- and four-character GitHub username candidates.")
+		fmt.Fprintln(os.Stderr, "hunt - find GitHub and Discord usernames.")
 		fmt.Fprintln(os.Stderr, "Usage: hunt [flags]")
-		fmt.Fprintln(os.Stderr, "Results are observations to verify; no account changes are submitted.")
+		fmt.Fprintln(os.Stderr, "Finder mode reports observations. GitHub account changes require explicit -claim settings.")
 		fmt.Fprintln(os.Stderr)
 		flag.PrintDefaults()
 	}
@@ -85,13 +91,55 @@ func main() {
 		fmt.Fprintln(os.Stdout, "hunt", version)
 		return
 	}
-	if flag.NArg() != 0 || (*length != 3 && *length != 4) || *n < 0 || *batch < 1 || *batch > 100 || *path == "" || *verifyOut == "" || *find < 0 {
+	explicit := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+	if err := validatePlatformFlags(*platform, explicit); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if flag.NArg() != 0 || *n < 0 || *path == "" || *find < 0 {
+		fmt.Fprintln(os.Stderr, "Use -n >= 0, -find >= 0, and a nonempty -out; see -help.")
+		os.Exit(2)
+	}
+	effectiveFind, err := validateClaimFlags(*platform, *claim, *claimCookies, *claimAccount, *find, explicit)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	*find = effectiveFind
+	if *platform == "github" && ((*length != 3 && *length != 4) || *batch < 1 || *batch > 100 || *verifyOut == "") {
 		fmt.Fprintln(os.Stderr, "Use -length 3 or 4, -n >= 0, -batch 1..100, and a nonempty -out; see -help.")
+		os.Exit(2)
+	}
+	if *platform == "discord" && (*delay < time.Second || (*input == "" && (*length < 2 || *length > 4))) {
+		fmt.Fprintln(os.Stderr, "Discord generation uses -length 2..4 and requires -delay >= 1s; -input accepts names of length 2..32.")
 		os.Exit(2)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	progress := terminalProgress(os.Stderr, stderrIsTerminal(os.Stderr), *quiet, *noColor)
+	if *platform == "discord" {
+		if !explicit["out"] {
+			*path = "discord-results.jsonl"
+		}
+		alphabet := "abcdefghijklmnopqrstuvwxyz"
+		if *digits {
+			alphabet += "0123456789"
+		}
+		if *symbols {
+			alphabet += "_."
+		}
+		cfg := discordConfig{Version: 1, Platform: "discord", Length: *length, Alphabet: alphabet, Seed: *seed}
+		cfg, err := configureDiscordSource(cfg, *input, *pattern)
+		if err == nil {
+			err = runDiscord(ctx, discordOptions{Config: cfg, N: *n, Find: *find, Fresh: *fresh, Out: *path, Delay: *delay}, os.Stdout, progress)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Stopped:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if *verify != "" {
 		if err := verifyFileWithRefresh(ctx, *verify, *verifyOut, progress, *fresh); err != nil {
 			fmt.Fprintln(os.Stderr, "Stopped:", err)
@@ -104,9 +152,18 @@ func main() {
 		alphabet += "0123456789"
 	}
 	cfg := config{Version: 1, Length: *length, Alphabet: alphabet, Seed: *seed, Recheck: *fresh}
-	cfg, err := configureSource(cfg, *input, *pattern)
+	cfg, err = configureSource(cfg, *input, *pattern)
 	if err == nil {
-		if *liveVerify || *find > 0 {
+		if *claim {
+			var claimer *githubClaimer
+			err = validateClaimPaths(*claimCookies, *path, *verifyOut, *input)
+			if err == nil {
+				claimer, err = newGitHubClaimer(*claimCookies, *claimAccount)
+			}
+			if err == nil {
+				err = runPipelineWithClaim(ctx, cfg, *n, *batch, *path, *verifyOut, *find, os.Stdout, progress, claimer.Claim)
+			}
+		} else if *liveVerify || *find > 0 {
 			err = runPipeline(ctx, cfg, *n, *batch, *path, *verifyOut, *find, os.Stdout, progress)
 		} else {
 			err = run(ctx, cfg, *n, *batch, *path, os.Stdout, progress)
@@ -116,6 +173,57 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Stopped:", err)
 		os.Exit(1)
 	}
+}
+
+func validateClaimPaths(cookiePath string, dataPaths ...string) error {
+	for _, path := range dataPaths {
+		if sameFilePath(cookiePath, path) {
+			return errors.New("the claim cookie file must differ from all input and results files")
+		}
+	}
+	return nil
+}
+
+func validatePlatformFlags(platform string, explicit map[string]bool) error {
+	switch platform {
+	case "discord":
+		for _, name := range []string{"verify", "verify-out", "batch", "live-verify", "claim", "claim-cookies", "claim-account"} {
+			if explicit[name] {
+				return fmt.Errorf("-%s is GitHub-only; Discord checks availability directly", name)
+			}
+		}
+	case "github":
+		for _, name := range []string{"symbols", "delay"} {
+			if explicit[name] {
+				return fmt.Errorf("-%s is Discord-only", name)
+			}
+		}
+	default:
+		return errors.New("-platform must be github or discord")
+	}
+	return nil
+}
+
+func validateClaimFlags(platform string, enabled bool, cookiePath, account string, find int, explicit map[string]bool) (int, error) {
+	if !enabled {
+		if cookiePath != "" || account != "" || explicit["claim-cookies"] || explicit["claim-account"] {
+			return find, errors.New("-claim-cookies and -claim-account require explicit -claim")
+		}
+		return find, nil
+	}
+	if platform != "github" {
+		return find, errors.New("-claim is supported only for GitHub")
+	}
+	if strings.TrimSpace(cookiePath) == "" || strings.TrimSpace(account) == "" {
+		return find, errors.New("-claim requires both -claim-cookies and -claim-account")
+	}
+	if find < 0 {
+		return find, errors.New("-find must not be negative")
+	}
+	if find > 1 || explicit["verify"] || explicit["live-verify"] {
+		return find, errors.New("-claim handles one verified name; use -find 1 and omit -verify and -live-verify")
+	}
+	return 1, nil
 }
 
 func run(ctx context.Context, cfg config, n, batch int, path string, out, log io.Writer) error {

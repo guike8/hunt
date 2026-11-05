@@ -36,9 +36,11 @@ def main():
                  f"-s -w -X main.version={args.version}", "-o", str(binary), "."],
                 cwd=root, env=environment, check=True,
             )
-            files = [(binary_name, binary.read_bytes(), 0o755),
-                     ("LICENSE", (root / "LICENSE").read_bytes(), 0o644),
-                     ("README.md", (root / "README.md").read_bytes(), 0o644)]
+            files = [(binary_name, binary.read_bytes(), 0o755)]
+            for document in ("LICENSE", "README.md", "CHANGELOG.md", "COMPARISON.md",
+                             "benchmark-results.txt", "live-benchmark.json",
+                             "assets/hero.svg", "assets/terminal.svg"):
+                files.append((document, (root / document).read_bytes(), 0o644))
             suffix = "zip" if system == "windows" else "tar.gz"
             archive = destination / f"hunt_{args.version}_{system}_{arch}.{suffix}"
             if suffix == "zip":

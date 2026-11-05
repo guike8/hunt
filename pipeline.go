@@ -36,6 +36,13 @@ func sameFilePath(left, right string) bool {
 }
 
 func runPipeline(ctx context.Context, cfg config, n, batch int, path, verifyPath string, find int, out, log io.Writer) error {
+	return runPipelineWithClaim(ctx, cfg, n, batch, path, verifyPath, find, out, log, nil)
+}
+
+func runPipelineWithClaim(ctx context.Context, cfg config, n, batch int, path, verifyPath string, find int, out, log io.Writer, claim func(context.Context, string) error) error {
+	if claim != nil && find != 1 {
+		return errors.New("GitHub rename mode requires exactly one verified name")
+	}
 	if sameFilePath(path, verifyPath) {
 		return errors.New("discovery and verification need different journal paths")
 	}
@@ -47,11 +54,11 @@ func runPipeline(ctx context.Context, cfg config, n, batch int, path, verifyPath
 		return err
 	}
 	defer session.Close()
-	session.force = cfg.Recheck
-	return streamFind(ctx, find, out, log,
+	session.force = cfg.Recheck || claim != nil
+	return streamFindWithClaim(ctx, find, out, log,
 		func(scanCtx context.Context, enqueue func(string) error, safeLog io.Writer) error {
 			return runDiscovery(scanCtx, cfg, n, batch, path, io.Discard, safeLog, enqueue)
-		}, session.verify)
+		}, session.verify, claim)
 }
 
 // One producer and one paced verifier overlap work. The bounded queue provides
@@ -59,6 +66,16 @@ func runPipeline(ctx context.Context, cfg config, n, batch int, path, verifyPath
 func streamFind(ctx context.Context, find int, out, log io.Writer,
 	produce func(context.Context, func(string) error, io.Writer) error,
 	check func(context.Context, string) (verification, error)) error {
+	return streamFindWithClaim(ctx, find, out, log, produce, check, nil)
+}
+
+func streamFindWithClaim(ctx context.Context, find int, out, log io.Writer,
+	produce func(context.Context, func(string) error, io.Writer) error,
+	check func(context.Context, string) (verification, error),
+	claim func(context.Context, string) error) error {
+	if claim != nil && find != 1 {
+		return errors.New("GitHub rename mode requires exactly one verified name")
+	}
 	scanCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	names := make(chan string, 32)
@@ -101,8 +118,32 @@ func streamFind(ctx context.Context, find int, out, log io.Writer,
 			if err != nil {
 				return finish(fmt.Errorf("verify %s: %w", name, err))
 			}
+			if claim != nil && (result.Name != name || (result.Status != "available" && result.Status != "unavailable")) {
+				return finish(errors.New("refusing to claim after an inconclusive or mismatched verification"))
+			}
 			fmt.Fprintf(safeLog, "%s: %s\n", name, result.Status)
 			if result.Status == "available" {
+				if claim != nil {
+					if result.Name != name || !shortName.MatchString(name) {
+						return finish(errors.New("refusing to claim a name without a matching three- or four-character verification"))
+					}
+					if err := ctx.Err(); err != nil {
+						return finish(err)
+					}
+					// Stop discovery before the single account change. Keep the
+					// caller context active so canceling the producer cannot cancel
+					// confirmation of a rename that has already been submitted.
+					cancel()
+					if err := claim(ctx, name); err != nil {
+						return finish(fmt.Errorf("claim %s: %w", name, err))
+					}
+					if _, err := fmt.Fprintln(out, name); err != nil {
+						return finish(fmt.Errorf("GitHub rename to %s succeeded, but writing its result failed: %w", name, err))
+					}
+					fmt.Fprintf(safeLog, "GitHub rename confirmed: %s. Stopping after one account change.\n", name)
+					<-producerDone
+					return nil
+				}
 				if _, err := fmt.Fprintln(out, name); err != nil {
 					return finish(err)
 				}

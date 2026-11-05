@@ -20,9 +20,9 @@ func terminalProgress(stderr io.Writer, isTerminal, quiet, noColor bool) io.Writ
 	if isTerminal {
 		_, colorDisabled := os.LookupEnv("NO_COLOR")
 		if !noColor && !colorDisabled {
-			fmt.Fprintln(stderr, "\x1b[1;38;2;45;212;191mhunt\x1b[0m  GitHub username finder")
+			fmt.Fprintln(stderr, "\x1b[1;38;2;45;212;191mhunt\x1b[0m  username finder")
 		} else {
-			fmt.Fprintln(stderr, "hunt  GitHub username finder")
+			fmt.Fprintln(stderr, "hunt  username finder")
 		}
 	}
 	return stderr

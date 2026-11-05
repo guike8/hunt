@@ -9,4 +9,7 @@
 /names.txt
 /.env
 /.env.*
+*cookies*.json
+*cookies*.txt
+*.cookies
 .DS_Store

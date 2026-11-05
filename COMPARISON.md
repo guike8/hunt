@@ -43,14 +43,14 @@ go test -run '^$' -bench . -benchmem -benchtime=500ms -count=3
 | [amirhosse1n/namescope](https://github.com/amirhosse1n/namescope) | API then signup validation, graded result labels, persistent history | Preserve distinct candidate/available/unknown semantics in a dependency-free Go CLI with streaming verification |
 | [1870s/Github-Username-Checker](https://github.com/1870s/Github-Username-Checker) | Text input, autosave, resume, fixed retry waits | Bind wordlist hashes to journals; respect actual rate headers; never classify an API-null owner as confirmed available |
 | [metecan/AvailableUsernameFinder-WebScraping](https://github.com/metecan/AvailableUsernameFinder-WebScraping) | Simple random four-letter Go scraper using Colly | No third-party Go modules; complete duplicate-free generation, batching, verification, recovery |
-| [xbubbo/Github-Username-Checker](https://github.com/xbubbo/Github-Username-Checker) | Lookup then browser-cookie rename validation | Use read-only signup validation without copied cookies or account actions |
+| [xbubbo/Github-Username-Checker](https://github.com/xbubbo/Github-Username-Checker) | Lookup then browser-cookie rename validation | Finder uses read-only signup validation; the separately enabled GitHub claim flow is not part of these benchmarks |
 | [bffr24/GitHub-name-checker](https://github.com/bffr24/GitHub-name-checker) | Exhaustive random three/four-letter generation, multiple availability signals, header-based pauses | Complete generation plus durable pending validation; ambiguous outcomes remain unknown |
 | [yTax/Github-Username-Checker](https://github.com/yTax/Github-Username-Checker) | Wordlists, named sessions, web scraping, fixed retry pause | Source-bound resumable journals, GraphQL batches, persisted request cadence and cooldown |
 | [DefaultPerson/github-usernames-checker](https://github.com/DefaultPerson/github-usernames-checker) | Go worker pool, retries, wordlist, cookie auto-claim | Batch to reduce request count; bounded verification queue and cancellation. Account-changing features are outside this task |
 | [c7md/GUC](https://github.com/c7md/GUC) | Go API checks from a username file | Ordered deduplicated input, grouped lookups, durable resume, actual validator checks |
 | [zaan-app/scato](https://github.com/zaan-app/scato) | Multi-platform checks, explicit unknown/rate outcomes, caveats for GitHub page heuristics | GitHub-specific two-stage checking; do not infer availability from an error page |
 
-None of these inspected READMEs documents GraphQL alias batching or an explicit stop-after-N verified-results option. Their existence elsewhere remains possible. Features such as chat notifications, web dashboards, other platforms, and account claiming were intentionally excluded from this user's finder-only task.
+None of these inspected READMEs documents GraphQL alias batching or an explicit stop-after-N verified-results option. Their existence elsewhere remains possible. This comparison covers finder behavior, not chat notifications, dashboards, or the later opt-in GitHub claim flow. Discord was added after this GitHub-focused comparison and is not covered by these throughput measurements.
 
 ## What is now tested
 
