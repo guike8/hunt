@@ -184,7 +184,9 @@ func openVerificationSession(path string) (*verificationSession, error) {
 	if err != nil {
 		return nil, err
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
+	// The exclusive lock and readJournal's final Seek provide append safety.
+	// O_APPEND denies Truncate on Windows and prevents torn-tail recovery.
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		unlock()
 		return nil, err
