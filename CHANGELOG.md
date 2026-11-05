@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.3.0 (unreleased)
+## v0.3.0
 
 - Added search-only `-wait` recovery for known server cooldowns and exhausted temporary connection/server failures. Completed checks survive retry passes; authentication, challenges, unknown schemas, and persistence errors still stop the search.
 - Generate names from cached integer positions instead of materializing the full string namespace. Preserve seeded GitHub and Discord order, direct wildcard expansion, ordered wordlists, and source-bound journal compatibility.
