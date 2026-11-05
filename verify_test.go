@@ -19,6 +19,13 @@ type verificationTransport func(*http.Request) (*http.Response, error)
 
 func (f verificationTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
+type verificationReadFailure struct{}
+
+func (verificationReadFailure) Read([]byte) (int, error) {
+	return 0, errors.New("private read failure")
+}
+func (verificationReadFailure) Close() error { return nil }
+
 func TestWebVerificationClassifiesOnlyExplicitName(t *testing.T) {
 	for _, tc := range []struct {
 		name, body, want string
@@ -26,6 +33,11 @@ func TestWebVerificationClassifiesOnlyExplicitName(t *testing.T) {
 	}{
 		{"available", "abc is available.", "available", 200},
 		{"unavailable despite suggestions", `<div>Username abc is not available.</div><span>abc123 is available.</span>`, "unavailable", 422},
+		{"quoted unavailable", `<div>Username &#39;abc&#39; is unavailable.</div>`, "unavailable", 422},
+		{"double quoted not available", `Username "abc" is not available.`, "unavailable", 422},
+		{"unquoted unavailable", `Username abc is unavailable.`, "unavailable", 422},
+		{"wrong quoted unavailable", `Username 'xyz' is unavailable.`, "", 422},
+		{"suggestion only", `Suggestion: Username 'abc' is unavailable.`, "", 422},
 		{"wrong available name", "xyz is available.", "", 200},
 		{"generic not found", "<html>Not Found</html>", "", 404},
 		{"challenge", "Verify you are human", "", 200},
@@ -43,6 +55,60 @@ func TestWebVerificationClassifiesOnlyExplicitName(t *testing.T) {
 			got, err := v.check(context.Background(), "abc")
 			if got != tc.want || (err == nil) != (tc.want != "") {
 				t.Fatalf("got %q, %v; want %q", got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestVerificationOnlyDefiniteRateLimitsPermitWaiting(t *testing.T) {
+	for _, code := range []int{http.StatusTooManyRequests, http.StatusForbidden} {
+		v := webVerifier{client: &http.Client{Transport: verificationTransport(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: code, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("blocked"))}, nil
+		})}}
+		_, err := v.check(context.Background(), "abc")
+		var cooldown *searchCooldownError
+		if errors.As(err, &cooldown) != (code == http.StatusTooManyRequests) {
+			t.Fatalf("HTTP%d incorrectly classified for automatic wait: %v", code, err)
+		}
+	}
+}
+
+func TestVerificationExhaustedTransientFailuresAreTyped(t *testing.T) {
+	for _, mode := range []string{"connection", "server", "read", "challenge", "serverChallenge", "malformed", "auth"} {
+		t.Run(mode, func(t *testing.T) {
+			calls := 0
+			v := webVerifier{sleep: func(context.Context, time.Duration) error { return nil }, client: &http.Client{Transport: verificationTransport(func(*http.Request) (*http.Response, error) {
+				calls++
+				if mode == "connection" {
+					return nil, errors.New("private proxy diagnostic")
+				}
+				code, body := 200, "not recognized"
+				if mode == "server" {
+					code = 503
+				}
+				if mode == "auth" {
+					code = 401
+				}
+				if mode == "challenge" {
+					body = "Verify you are human"
+				}
+				if mode == "serverChallenge" {
+					code, body = 503, "Verify you are human"
+				}
+				response := &http.Response{StatusCode: code, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
+				if mode == "read" {
+					response.Body = verificationReadFailure{}
+				}
+				return response, nil
+			})}}
+			status, err := v.check(context.Background(), "abc")
+			var transient *searchTransientError
+			want := mode == "connection" || mode == "server" || mode == "read"
+			if status != "" || err == nil || errors.As(err, &transient) != want || (want && calls != 3) || (!want && calls != 1) {
+				t.Fatalf("wrong transient classification: mode=%s status=%s err=%v calls=%d", mode, status, err, calls)
+			}
+			if strings.Contains(err.Error(), "private") {
+				t.Fatal("private diagnostics leaked")
 			}
 		})
 	}
@@ -376,5 +442,145 @@ func TestVerificationCooldownUsesConservativeMinimum(t *testing.T) {
 		if got := verificationCooldown(value, now); !got.Equal(now.Add(duration)) {
 			t.Fatalf("%s: got %s, want %s", fmt.Sprintf("Retry-After %q", value), got, now.Add(duration))
 		}
+	}
+}
+
+func TestVerificationPublicationSurvivesRestartAndUsesObservationGeneration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "verified.jsonl")
+	now := time.Date(2026, 11, 5, 18, 0, 0, 0, time.UTC)
+	s, err := openVerificationSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A legacy journal has no publication acknowledgment or generation.
+	if err := s.write(verification{Name: "abc", Status: "available", CheckedAt: now, Source: validationURL}); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s, err = openVerificationSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.needsPublish("abc") {
+		t.Fatal("a result persisted before stdout was silently treated as delivered")
+	}
+	first, _ := s.recorded("abc")
+	if first.Generation != 1 || s.markPublished(first) != nil || s.needsPublish("abc") {
+		t.Fatalf("legacy observation could not be acknowledged: %#v", first)
+	}
+	// Keep the same timestamp for a second observation. Its acknowledgment
+	// must be separate even when the wall clock does not advance.
+	calls := 0
+	verificationTestHTTP(t, s, &now, &calls, http.StatusOK)
+	s.verifier.interval = 0
+	s.force = true
+	second, err := s.verify(context.Background(), "abc")
+	if err != nil || second.Generation != 2 || !second.CheckedAt.Equal(first.CheckedAt) || !s.needsPublish("abc") {
+		t.Fatalf("new observation identity was lost: %#v err=%v", second, err)
+	}
+	if err := s.markPublished(first); err == nil {
+		t.Fatal("an old generation acknowledged a newer observation")
+	}
+	if err := s.markPublished(second); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s, err = openVerificationSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if s.needsPublish("abc") {
+		t.Fatal("durable publication acknowledgment was lost on restart")
+	}
+}
+
+func TestVerificationJournalLastCompletedRowWinsAfterClockRollback(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "verified.jsonl")
+	s, err := openVerificationSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 5, 18, 0, 0, 0, time.UTC)
+	for i, status := range []string{"available", "unavailable"} {
+		if err := s.write(verification{Name: "abc", Status: status, CheckedAt: now.Add(-time.Duration(i) * time.Hour), Source: validationURL}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Close()
+	s, err = openVerificationSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	latest, found := s.recorded("abc")
+	if !found || latest.Status != "unavailable" || latest.Generation != 2 || s.needsPublish("abc") {
+		t.Fatalf("clock rollback restored an obsolete positive: %#v", latest)
+	}
+}
+
+func TestVerificationRejectsInvalidPublicationAcknowledgments(t *testing.T) {
+	for _, generation := range []uint64{0, 2} {
+		t.Run(fmt.Sprint(generation), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "verified.jsonl")
+			s, err := openVerificationSession(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.write(verification{Name: "abc", Status: "available", CheckedAt: time.Now().UTC(), Source: validationURL}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.write(publicationAck{Type: "published", Name: "abc", Generation: generation}); err != nil {
+				t.Fatal(err)
+			}
+			s.Close()
+			if reopened, err := openVerificationSession(path); err == nil {
+				reopened.Close()
+				t.Fatal("invalid or future acknowledgment generation was accepted")
+			}
+		})
+	}
+}
+
+func TestProviderCooldownSurvivesResultJournalFailure(t *testing.T) {
+	for _, provider := range []string{"github-signup", "discord-eligibility"} {
+		t.Run(provider, func(t *testing.T) {
+			t.Setenv("HUNT_STATE_DIR", t.TempDir())
+			gate, err := newProviderGate(provider, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Date(2026, 11, 5, 18, 0, 0, 0, time.UTC)
+			gate.now = func() time.Time { return now }
+			journalFailure := func(time.Time) error { return errors.New("result journal unavailable") }
+			if provider == "github-signup" {
+				v := webVerifier{gate: gate, now: func() time.Time { return now }, onCooldown: journalFailure,
+					client: &http.Client{Transport: verificationTransport(func(*http.Request) (*http.Response, error) {
+						return &http.Response{StatusCode: 429, Header: http.Header{"Retry-After": {"120"}}, Body: io.NopCloser(strings.NewReader(""))}, nil
+					})}}
+				if _, err := v.check(context.Background(), "abc"); err == nil {
+					t.Fatal("journal failure was ignored")
+				}
+			} else {
+				d := discordClient{gate: gate, now: func() time.Time { return now }, onCooldown: journalFailure,
+					http: &http.Client{Transport: discordTestTransport(func(*http.Request) (*http.Response, error) {
+						return discordTestResponse(429, `{"retry_after":120}`, nil), nil
+					})}}
+				if _, err := d.check(context.Background(), "abc"); err == nil {
+					t.Fatal("journal failure was ignored")
+				}
+			}
+			// This also verifies that the failed request path released its lock.
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			lease, err := gate.Begin(ctx, time.Time{}, time.Time{})
+			if lease != nil {
+				lease.Close()
+			}
+			var cooldown *searchCooldownError
+			if !errors.As(err, &cooldown) {
+				t.Fatalf("another process could bypass the server cooldown: %v", err)
+			}
+		})
 	}
 }

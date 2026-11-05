@@ -22,10 +22,11 @@ var markup = regexp.MustCompile(`<[^>]*>`)
 var shortName = regexp.MustCompile(`^[a-z0-9]{3,4}$`)
 
 type verification struct {
-	Name      string    `json:"name"`
-	Status    string    `json:"status"`
-	CheckedAt time.Time `json:"checkedAt"`
-	Source    string    `json:"source"`
+	Name       string    `json:"name"`
+	Status     string    `json:"status"`
+	CheckedAt  time.Time `json:"checkedAt"`
+	Source     string    `json:"source"`
+	Generation uint64    `json:"generation,omitempty"`
 }
 
 type webVerifier struct {
@@ -37,14 +38,23 @@ type webVerifier struct {
 	now           func() time.Time
 	beforeRequest func(time.Time) error
 	onCooldown    func(time.Time) error
+	gate          *providerGate
 }
 
 type verificationSession struct {
-	file     *os.File
-	unlock   func() error
-	verifier *webVerifier
-	cache    map[string]verification
-	force    bool
+	file        *os.File
+	unlock      func() error
+	verifier    *webVerifier
+	cache       map[string]verification
+	force       bool
+	generations map[string]uint64
+	published   map[string]uint64
+}
+
+type publicationAck struct {
+	Type       string `json:"type"`
+	Name       string `json:"name"`
+	Generation uint64 `json:"generation"`
 }
 
 type verificationControl struct {
@@ -81,8 +91,8 @@ func (v *webVerifier) check(ctx context.Context, name string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	if v.clock().Before(v.cooldown) {
-		return "", fmt.Errorf("web verification cooldown; do not retry before %s", v.cooldown.UTC().Format(time.RFC3339))
+	if v.gate == nil && v.clock().Before(v.cooldown) {
+		return "", cooldownFailure(v.cooldown, "GitHub verification cooldown")
 	}
 	if v.sleep == nil {
 		v.sleep = verificationPause
@@ -91,7 +101,14 @@ func (v *webVerifier) check(ctx context.Context, name string) (string, error) {
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		if !v.last.IsZero() {
+		var lease *providerLease
+		if v.gate != nil {
+			var err error
+			lease, err = v.gate.Begin(ctx, v.last, v.cooldown)
+			if err != nil {
+				return "", err
+			}
+		} else if !v.last.IsZero() {
 			if delay := v.last.Add(v.interval).Sub(v.clock()); delay > 0 {
 				if err := v.sleep(ctx, delay); err != nil {
 					return "", err
@@ -102,6 +119,7 @@ func (v *webVerifier) check(ctx context.Context, name string) (string, error) {
 		// token, browser cookie, or a rename request. Unknown responses stop.
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, validationURL+"?value="+url.QueryEscape(name), nil)
 		if err != nil {
+			closeSearchLease(lease)
 			return "", err
 		}
 		req.Header.Set("Accept", "text/fragment+html")
@@ -109,46 +127,73 @@ func (v *webVerifier) check(ctx context.Context, name string) (string, error) {
 		v.last = v.clock()
 		if v.beforeRequest != nil {
 			if err := v.beforeRequest(v.last); err != nil {
+				closeSearchLease(lease)
 				return "", fmt.Errorf("could not persist verification request time: %w", err)
 			}
 		}
+		progressRequest(ctx, "verification")
 		response, err := v.client.Do(req)
 		if err != nil {
+			if releaseErr := closeSearchLease(lease); releaseErr != nil {
+				return "", releaseErr
+			}
 			if ctx.Err() != nil {
 				return "", ctx.Err()
 			}
 			if attempt < 2 {
 				continue
 			}
-			return "", errors.New("verification connection failed after 3 attempts; availability unknown")
+			return "", transientFailure("GitHub verification connection attempts exhausted")
 		}
 		if response.StatusCode == http.StatusTooManyRequests || response.StatusCode == http.StatusForbidden || response.Header.Get("Retry-After") != "" {
 			response.Body.Close()
 			v.cooldown = verificationCooldown(response.Header.Get("Retry-After"), v.clock())
+			if lease != nil {
+				if err := lease.Cooldown(v.cooldown); err != nil {
+					closeSearchLease(lease)
+					return "", err
+				}
+			}
 			if v.onCooldown != nil {
 				if err := v.onCooldown(v.cooldown); err != nil {
+					closeSearchLease(lease)
 					return "", fmt.Errorf("web verification stopped (HTTP %d); do not retry before %s; could not persist cooldown: %w", response.StatusCode, v.cooldown.UTC().Format(time.RFC3339), err)
 				}
 			}
-			return "", fmt.Errorf("web verification stopped (HTTP %d); do not retry before %s; no more requests sent", response.StatusCode, v.cooldown.UTC().Format(time.RFC3339))
+			if err := closeSearchLease(lease); err != nil {
+				return "", err
+			}
+			if response.StatusCode == http.StatusForbidden && response.Header.Get("Retry-After") == "" {
+				return "", errors.New("GitHub verification was denied (HTTP 403); availability unknown; search stopped")
+			}
+			return "", cooldownFailure(v.cooldown, "GitHub verification rate limit")
 		}
 		if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusUnprocessableEntity && response.StatusCode < 500 {
 			response.Body.Close()
+			if err := closeSearchLease(lease); err != nil {
+				return "", err
+			}
 			return "", fmt.Errorf("unrecognized verification response (HTTP %d); availability unknown", response.StatusCode)
 		}
 		body, readErr := io.ReadAll(io.LimitReader(response.Body, 128*1024+1))
 		response.Body.Close()
+		if err := closeSearchLease(lease); err != nil {
+			return "", err
+		}
 		if response.StatusCode >= 500 && response.StatusCode <= 599 {
+			if searchChallengeResponse(body) {
+				return "", errors.New("GitHub verification returned a challenge; availability unknown; search stopped")
+			}
 			if attempt < 2 {
 				continue
 			}
-			return "", fmt.Errorf("verification HTTP %d after 3 attempts; availability unknown", response.StatusCode)
+			return "", transientFailure("GitHub verification server attempts exhausted")
 		}
 		if readErr != nil {
 			if attempt < 2 {
 				continue
 			}
-			return "", errors.New("could not read verification response after 3 attempts; availability unknown")
+			return "", transientFailure("GitHub verification response reads exhausted")
 		}
 		if len(body) > 128*1024 {
 			return "", errors.New("unexpectedly large verification response; availability unknown")
@@ -159,12 +204,31 @@ func (v *webVerifier) check(ctx context.Context, name string) (string, error) {
 		}
 		// Suggestions can contain "available"; only the requested name's
 		// explicit rejection counts as unavailable.
-		if response.StatusCode == http.StatusUnprocessableEntity && strings.Contains(text, "Username "+name+" is not available.") {
+		if response.StatusCode == http.StatusUnprocessableEntity && explicitGitHubUnavailable(text, name) {
 			return "unavailable", nil
 		}
 		return "", fmt.Errorf("unrecognized verification response (HTTP %d); availability unknown; endpoint may have changed", response.StatusCode)
 	}
 	return "", errors.New("verification attempts exhausted; availability unknown")
+}
+
+func closeSearchLease(lease *providerLease) error {
+	if lease == nil {
+		return nil
+	}
+	return lease.Close()
+}
+
+func explicitGitHubUnavailable(text, name string) bool {
+	for _, subject := range []string{name, "'" + name + "'", `"` + name + `"`} {
+		for _, ending := range []string{" is not available.", " is unavailable."} {
+			message := "Username " + subject + ending
+			if text == message || strings.HasPrefix(text, message+" ") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func verificationCooldown(value string, now time.Time) time.Time {
@@ -191,7 +255,7 @@ func openVerificationSession(path string) (*verificationSession, error) {
 		unlock()
 		return nil, err
 	}
-	s := &verificationSession{file: file, unlock: unlock, cache: make(map[string]verification), verifier: &webVerifier{client: &http.Client{Timeout: 15 * time.Second}, interval: 7 * time.Second}}
+	s := &verificationSession{file: file, unlock: unlock, cache: make(map[string]verification), generations: make(map[string]uint64), published: make(map[string]uint64), verifier: &webVerifier{client: &http.Client{Timeout: 15 * time.Second}, interval: 7 * time.Second}}
 	if err := readJournal(file, func(line []byte, lineNo int) error {
 		var control verificationControl
 		if json.Unmarshal(line, &control) != nil {
@@ -209,13 +273,26 @@ func openVerificationSession(path string) (*verificationSession, error) {
 			}
 			return nil
 		}
+		if control.Type == "published" {
+			var ack publicationAck
+			if json.Unmarshal(line, &ack) != nil || !shortName.MatchString(ack.Name) || ack.Generation == 0 || ack.Generation != s.generations[ack.Name] || s.cache[ack.Name].Status != "available" {
+				return fmt.Errorf("invalid publication acknowledgment at line %d", lineNo)
+			}
+			s.published[ack.Name] = ack.Generation
+			return nil
+		}
 		var saved verification
 		if control.Type != "" || json.Unmarshal(line, &saved) != nil || !shortName.MatchString(saved.Name) || (saved.Status != "available" && saved.Status != "unavailable") || saved.CheckedAt.IsZero() || saved.Source != validationURL {
 			return fmt.Errorf("invalid verification journal at line %d", lineNo)
 		}
-		if previous, ok := s.cache[saved.Name]; !ok || saved.CheckedAt.After(previous.CheckedAt) {
-			s.cache[saved.Name] = saved
+		generation := s.generations[saved.Name] + 1
+		if generation == 0 || (saved.Generation != 0 && saved.Generation != generation) {
+			return fmt.Errorf("invalid verification generation at line %d", lineNo)
 		}
+		saved.Generation = generation
+		s.generations[saved.Name] = generation
+		// Journal order, not wall-clock timestamps, defines the latest result.
+		s.cache[saved.Name] = saved
 		// Older journals did not save request starts; their result time is a
 		// conservative cadence checkpoint when upgrading.
 		if saved.CheckedAt.After(s.verifier.last) {
@@ -272,12 +349,44 @@ func (s *verificationSession) verify(ctx context.Context, name string) (verifica
 	if err != nil {
 		return verification{}, err
 	}
-	result := verification{Name: name, Status: status, CheckedAt: s.verifier.clock().UTC(), Source: validationURL}
+	result := verification{Name: name, Status: status, CheckedAt: s.verifier.clock().UTC(), Source: validationURL, Generation: s.generations[name] + 1}
+	if result.Generation == 0 {
+		return verification{}, errors.New("verification generation overflow")
+	}
 	if err := s.write(result); err != nil {
 		return verification{}, err
 	}
 	s.cache[name] = result
+	s.generations[name] = result.Generation
+	progressVerified(ctx, result)
 	return result, nil
+}
+
+func (s *verificationSession) needsPublish(name string) bool {
+	result, found := s.cache[name]
+	return found && result.Status == "available" && s.published[name] != result.Generation
+}
+
+func (s *verificationSession) markPublished(result verification) error {
+	current, found := s.cache[result.Name]
+	if !found || current.Status != "available" || result.Status != "available" || result.Generation == 0 || result.Generation != current.Generation {
+		return errors.New("refusing publication acknowledgment for an unknown or stale observation")
+	}
+	if s.published[result.Name] == result.Generation {
+		return nil
+	}
+	if err := s.write(publicationAck{Type: "published", Name: result.Name, Generation: result.Generation}); err != nil {
+		return err
+	}
+	s.published[result.Name] = result.Generation
+	return nil
+}
+
+// recorded returns the last durable observation for a resumed single pass.
+// An expired positive observation must still be reverified before reporting.
+func (s *verificationSession) recorded(name string) (verification, bool) {
+	result, found := s.cache[name]
+	return result, found
 }
 
 func (s *verificationSession) Close() error {
@@ -324,14 +433,35 @@ func verifyFileWithRefresh(ctx context.Context, inputPath, outputPath string, lo
 	}
 	defer session.Close()
 	session.force = fresh
+	available := 0
+	for _, result := range session.cache {
+		if result.Status == "available" {
+			available++
+		}
+	}
+	progressSource(ctx, len(names), len(session.cache))
+	progressVerification(ctx, len(session.cache), available)
+	gate, err := runtimeProviderGate("github-signup", session.verifier.interval)
+	if err != nil {
+		return err
+	}
+	session.verifier.gate = gate
 	for _, name := range names {
+		if !fresh {
+			if previous, found := session.recorded(name); found && previous.Status == "available" && !session.needsPublish(name) {
+				continue
+			}
+		}
 		result, err := session.verify(ctx, name)
 		if err != nil {
 			return fmt.Errorf("%s: %w", name, err)
 		}
 		fmt.Fprintf(log, "%s: %s (checked %s)\n", name, result.Status, result.CheckedAt.UTC().Format(time.RFC3339))
 		if result.Status == "available" {
-			if _, err := fmt.Fprintln(os.Stdout, name); err != nil {
+			if err := publishResult(os.Stdout, name); err != nil {
+				return err
+			}
+			if err := session.markPublished(result); err != nil {
 				return err
 			}
 		}

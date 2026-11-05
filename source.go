@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"os"
 	"strings"
 )
@@ -18,6 +17,7 @@ func configureSource(cfg config, inputPath, pattern string) (config, error) {
 	}
 	cfg.SourcePath, cfg.Pattern = inputPath, pattern
 	cfg.SourceHash = ""
+	cfg.Source = nil
 	if err := validateSourceConfig(cfg); err != nil {
 		return cfg, err
 	}
@@ -27,6 +27,14 @@ func configureSource(cfg config, inputPath, pattern string) (config, error) {
 			return cfg, err
 		}
 		cfg.SourceHash = wordlistHash(names)
+		cfg.Source = &nameSource{key: sourceKey{kind: "github", alphabet: cfg.Alphabet, pattern: cfg.Pattern, hash: cfg.SourceHash, path: cfg.SourcePath, length: cfg.Length, seed: cfg.Seed}, words: names}
+	}
+	if cfg.Source == nil {
+		source, err := githubSource(cfg)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.Source = source
 	}
 	return cfg, nil
 }
@@ -101,48 +109,11 @@ func readWordlist(path string, cfg config) ([]string, error) {
 // discoveryNames preserves wordlist order and shuffles generated sources using
 // the same seeded permutation as version 1, keeping existing journals resumable.
 func discoveryNames(cfg config) ([]string, error) {
-	if err := validateSourceConfig(cfg); err != nil {
+	source, err := githubSource(cfg)
+	if err != nil {
 		return nil, err
 	}
-	if cfg.SourceHash != "" || cfg.SourcePath != "" {
-		if cfg.SourcePath == "" {
-			return nil, errors.New("this journal requires its original -input wordlist")
-		}
-		names, err := readWordlist(cfg.SourcePath, cfg)
-		if err != nil {
-			return nil, err
-		}
-		if cfg.SourceHash != wordlistHash(names) {
-			return nil, errors.New("wordlist contents changed; reuse the original list or choose a new -out")
-		}
-		return names, nil
-	}
-	total := namespaceSize(cfg)
-	var wildcardPositions []int
-	if cfg.Pattern != "" {
-		total = 1
-		for i := range cfg.Pattern {
-			if cfg.Pattern[i] == '?' {
-				wildcardPositions = append(wildcardPositions, i)
-				total *= len(cfg.Alphabet)
-			}
-		}
-	}
-	order := rand.New(rand.NewSource(cfg.Seed)).Perm(total)
-	names := make([]string, len(order))
-	for i, index := range order {
-		if cfg.Pattern == "" {
-			names[i] = nameAt(index, cfg)
-			continue
-		}
-		name := []byte(cfg.Pattern)
-		for j := len(wildcardPositions) - 1; j >= 0; j-- {
-			name[wildcardPositions[j]] = cfg.Alphabet[index%len(cfg.Alphabet)]
-			index /= len(cfg.Alphabet)
-		}
-		names[i] = string(name)
-	}
-	return names, nil
+	return source.materialize(), nil
 }
 
 type partialLookupError struct{ Names []string }

@@ -34,6 +34,40 @@ The journal cases each save 100 observations; the baseline syncs every observati
 go test -run '^$' -bench . -benchmem -benchtime=500ms -count=3
 ```
 
+### Source startup and journal replay (v0.3.0)
+
+Local macOS arm64 measurements on an Apple M5, three repetitions of each case with `-benchtime=1x`. No HTTP requests were made. Values below are medians; allocated bytes are Go benchmark allocations per operation, not peak live memory or resident process size.
+
+| Source startup | Materialized names | Indexed names | Reused indexed source |
+| --- | ---: | ---: | ---: |
+| Four alphanumeric characters: elapsed | 52.276 ms | 13.999 ms | 3.875 µs |
+| Four alphanumeric characters: allocated bytes | 47,046,248 | 13,449,800 | 1,112 |
+| Four alphanumeric characters: allocations | 1,679,631 | 14 | 7 |
+| Pattern `a?0?`: elapsed | 66.959 µs | 35.375 µs | 3.833 µs |
+| Pattern `a?0?`: allocated bytes | 44,520 | 17,576 | 1,112 |
+| Pattern `a?0?`: allocations | 1,309 | 12 | 7 |
+
+The full source contains 1,679,616 names from `a-z0-9`; the pattern contains 1,296. Both paths use the same seeded permutation and yield identical names in identical order. The materialized comparison constructs the strings upfront; the indexed source retains integer positions and creates names as batches consume them. This reduced startup allocation bytes by 71.4% for that full source, with later per-name string allocation deferred to consumption. Retry passes reuse the generated source, while wordlists are still read and checked against their bound hash.
+
+A synthetic 100,000-observation discovery journal, containing 90,000 taken names and 10,000 candidates, replayed in **170.029 ms** median with **66,964,256 allocated bytes** and **1,100,713 allocations**. The completed-name index still covers every conclusive observation; detailed FIFO history is retained only for names that have ever been candidates. JSON parsing and journal validation remain part of this measurement.
+
+These startup and replay cases do not measure provider throughput, available-name yield, or another repository's executable. See [raw output](optimization-benchmarks.txt), [source benchmark code](source_iter_test.go), and [replay benchmark code](store_test.go).
+
+```sh
+go test -run '^$' -bench 'Benchmark(GitHubSourceStartup|StoreReplay100k)$' -benchmem -benchtime=1x -count=3
+```
+
+### Opt-in larger GitHub batches
+
+The default remains 100 aliases per request; `-batch` now accepts up to 500. A bounded actual-CLI sample on November 5, 2026 used three-character alphanumeric generation with seed 771103:
+
+| Batch size | Completed lookups | Requests | CLI elapsed | Lookups / elapsed second |
+| --- | ---: | ---: | ---: | ---: |
+| 100 | 100 | 1 | 2.372 s | 42.2 |
+| 500 | 500 | 1 | 8.140 s | 61.4 |
+
+These were single runs with different workload sizes; elapsed time includes source startup and network latency. They support exposing the larger batch as an option, not a universal speedup claim. The 500-name response took longer, and both settings retain serial request starts and provider cooldowns. This does not measure signup verification or Discord. See [saved CLI measurements and limitations](optimization-live-benchmark.json).
+
 ## Public implementations inspected
 
 | Repository | Documented useful approach | Concrete response in this finder |
@@ -57,17 +91,19 @@ None of these inspected READMEs documents GraphQL alias batching or an explicit 
 - Both users and organizations are recognized as owners; null owners are candidates only.
 - Global schema/auth/rate failures stop requests. Partial alias failures are retried in smaller groups; unresolved names remain unchecked while unrelated names continue.
 - A complete discovery batch is durable before candidates reach stdout or the verifier queue.
-- Streaming verification uses a bounded queue and cancels discovery after the requested number of explicitly available names.
+- Streaming verification uses a growable queue bounded by the selected source for full verification, with a small bound for stop-after-N searches. It cancels discovery after the requested number of explicitly available names.
 - Every pending candidate can be replayed after interruption. Wordlist hashes, pattern, alphabet, length and seed prevent incompatible resume.
 - Both journals reject concurrent writers. Tests cover a second process and lock release when a process exits without an unlock callback.
 - Torn final records after a valid record recover; corrupt committed records are rejected. Complete final JSON without a newline is preserved and remains appendable.
-- Verification request timing and rate cooldown survive restart. Forced refresh bypasses cached observations, not pacing or cooldowns.
-- Transient retries are bounded. Unknown responses and suggestions for a different name never become available results.
+- Provider request timing and rate cooldown survive restart and coordinate across independent processes using the same provider-state directory. Forced refresh bypasses cached observations, not pacing or cooldowns.
+- Verified positive observations have durable output acknowledgments and replay after an interrupted output write. Regular files are synced before acknowledgment; crash duplicates remain possible.
+- Individual transient retry sequences are bounded. Search-only `-wait` can retry those sequences or wait through known cooldowns; unexpected responses, challenges, and authentication failures still stop. Unknown responses and suggestions for a different name never become available results.
+- Indexed generation preserves the exact seeded order for GitHub and filtered Discord names. Status snapshots are atomic and safe under concurrent progress updates; counters separate discovery from verification.
 - Race tests and vet pass on macOS. Builds compile for macOS, Linux amd64 and Windows amd64; Linux/Windows runtime behavior was not executed here.
 
 ## Limits that code cannot remove
 
-GitHub's registration validator is the throughput bottleneck for confirming candidates. This finder starts those requests at least seven seconds apart and stops on rate limits; increasing the discovery batch size cannot make GitHub confirm more names. No available three-letter name is guaranteed to exist. A successful response is only a current observation and does not reserve the name.
+GitHub's registration validator is the throughput bottleneck for confirming candidates. This finder starts those requests at least seven seconds apart and respects longer server cooldowns; increasing the discovery batch size cannot make GitHub confirm more names. `-wait` can continue after a known cooldown without bypassing it. No available three-letter name is guaranteed to exist. A successful response is only a timestamped observation and does not reserve the name.
 
 The validator is undocumented. Its current route and required `Accept: text/fragment+html` header were discovered in [the public checker's notes](https://github.com/y0f/github-user-checker#notes) and independently reproduced. For example, `njv` had no GraphQL owner but returned an explicit unavailable result. The old validator route returned generic 404 pages, which this implementation rejects.
 

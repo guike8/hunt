@@ -1,0 +1,24 @@
+{
+  "date": "2026-11-05",
+  "description": "Two bounded hunt discovery-only runs; single sample per size includes process startup and network latency. Candidates are not confirmed availability.",
+  "source": {
+    "length": 3,
+    "digits": true,
+    "seed": 771103
+  },
+  "results": [
+    {
+      "batch": 100,
+      "names_saved": 100,
+      "seconds": 2.372,
+      "requests": 1
+    },
+    {
+      "batch": 500,
+      "names_saved": 500,
+      "seconds": 8.14,
+      "requests": 1
+    }
+  ],
+  "limits": "Default remains 100; serial provider pacing and server cooldowns still apply. Verification was not run in this benchmark."
+}

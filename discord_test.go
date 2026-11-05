@@ -303,6 +303,47 @@ func TestDiscordRetriesAreBoundedAndPaced(t *testing.T) {
 	}
 }
 
+func TestDiscordExhaustedTransientFailuresAreTyped(t *testing.T) {
+	for _, mode := range []string{"connection", "server", "read", "challenge", "serverChallenge", "malformed", "auth"} {
+		t.Run(mode, func(t *testing.T) {
+			calls := 0
+			d := discordClient{sleep: func(context.Context, time.Duration) error { return nil }, http: &http.Client{Transport: discordTestTransport(func(*http.Request) (*http.Response, error) {
+				calls++
+				if mode == "connection" {
+					return nil, errors.New("private proxy diagnostic")
+				}
+				code, body := 200, `not json`
+				if mode == "server" {
+					code = 503
+				}
+				if mode == "auth" {
+					code = 401
+				}
+				if mode == "challenge" {
+					body = `{"taken":false,"captcha_key":["challenge"]}`
+				}
+				if mode == "serverChallenge" {
+					code, body = 503, `{"captcha_key":["challenge"]}`
+				}
+				response := discordTestResponse(code, body, nil)
+				if mode == "read" {
+					response.Body = verificationReadFailure{}
+				}
+				return response, nil
+			})}}
+			result, err := d.check(context.Background(), "abc")
+			var transient *searchTransientError
+			want := mode == "connection" || mode == "server" || mode == "read"
+			if result.Status != "" || err == nil || errors.As(err, &transient) != want || (want && calls != 3) || (!want && calls != 1) {
+				t.Fatalf("wrong transient classification: mode=%s result=%#v err=%v calls=%d", mode, result, err, calls)
+			}
+			if strings.Contains(err.Error(), "private") {
+				t.Fatal("private diagnostics leaked")
+			}
+		})
+	}
+}
+
 func TestDiscordJournalRecoveryConfigurationAndLock(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "discord.jsonl")
 	cfg := discordTestConfig()
@@ -357,5 +398,76 @@ func TestDiscordJournalKeepsLatestObservationWithEqualTimestamp(t *testing.T) {
 	discordTestClock(s.client, &now)
 	if result, found := s.cached("abc"); !found || result.Status != "unavailable" {
 		t.Fatalf("replay restored an older observation: %#v found=%t", result, found)
+	}
+}
+
+func TestDiscordPublicationGenerationSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "discord.jsonl")
+	s, err := openDiscordSession(path, discordTestConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 5, 18, 0, 0, 0, time.UTC)
+	discordTestClock(s.client, &now)
+	s.client.interval = 0
+	s.client.http.Transport = discordTestTransport(func(*http.Request) (*http.Response, error) {
+		return discordTestResponse(200, `{"taken":false}`, nil), nil
+	})
+	first, err := s.check(context.Background(), "abc", true)
+	if err != nil || first.Generation != 1 || !s.needsPublish("abc") {
+		t.Fatalf("first observation: %#v err=%v", first, err)
+	}
+	if err := s.markPublished(first); err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.check(context.Background(), "abc", true)
+	if err != nil || second.Generation != 2 || !first.CheckedAt.Equal(second.CheckedAt) || !s.needsPublish("abc") {
+		t.Fatalf("equal-time observation reused its acknowledgment: %#v err=%v", second, err)
+	}
+	if s.markPublished(first) == nil {
+		t.Fatal("stale observation acknowledged the latest generation")
+	}
+	s.Close()
+	s, err = openDiscordSession(path, discordTestConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.needsPublish("abc") || s.markPublished(second) != nil {
+		t.Fatal("unpublished generation did not survive restart")
+	}
+	s.Close()
+	s, err = openDiscordSession(path, discordTestConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if s.needsPublish("abc") {
+		t.Fatal("publication acknowledgment did not survive restart")
+	}
+}
+
+func TestDiscordRejectsInvalidPublicationAcknowledgments(t *testing.T) {
+	for _, generation := range []uint64{0, 2} {
+		t.Run(strconv.FormatUint(generation, 10), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "discord.jsonl")
+			s, err := openDiscordSession(path, discordTestConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.write(struct {
+				Type string `json:"type"`
+				verification
+			}{"discord_check", verification{Name: "abc", Status: "available", CheckedAt: time.Now().UTC(), Source: discordValidationURL}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.write(publicationAck{Type: "discord_published", Name: "abc", Generation: generation}); err != nil {
+				t.Fatal(err)
+			}
+			s.Close()
+			if reopened, err := openDiscordSession(path, discordTestConfig()); err == nil {
+				reopened.Close()
+				t.Fatal("invalid or future acknowledgment generation was accepted")
+			}
+		})
 	}
 }

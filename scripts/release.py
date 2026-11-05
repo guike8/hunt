@@ -39,6 +39,7 @@ def main():
             files = [(binary_name, binary.read_bytes(), 0o755)]
             for document in ("LICENSE", "README.md", "CHANGELOG.md", "COMPARISON.md",
                              "benchmark-results.txt", "live-benchmark.json",
+                             "optimization-benchmarks.txt", "optimization-live-benchmark.json",
                              "assets/hero.svg", "assets/terminal.svg"):
                 files.append((document, (root / document).read_bytes(), 0o644))
             suffix = "zip" if system == "windows" else "tar.gz"

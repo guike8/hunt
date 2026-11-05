@@ -4,24 +4,25 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
-	"math/rand"
 	"os"
 	"strings"
 )
 
 type discordConfig struct {
-	Version    int    `json:"version"`
-	Platform   string `json:"platform"`
-	Length     int    `json:"length"`
-	Alphabet   string `json:"alphabet"`
-	Pattern    string `json:"pattern,omitempty"`
-	SourceHash string `json:"source_hash,omitempty"`
-	Seed       int64  `json:"seed"`
-	SourcePath string `json:"-"`
+	Version    int         `json:"version"`
+	Platform   string      `json:"platform"`
+	Length     int         `json:"length"`
+	Alphabet   string      `json:"alphabet"`
+	Pattern    string      `json:"pattern,omitempty"`
+	SourceHash string      `json:"source_hash,omitempty"`
+	Seed       int64       `json:"seed"`
+	SourcePath string      `json:"-"`
+	Source     *nameSource `json:"-"`
 }
 
 func persistentDiscordConfig(cfg discordConfig) discordConfig {
 	cfg.SourcePath = ""
+	cfg.Source = nil
 	return cfg
 }
 
@@ -30,6 +31,7 @@ func configureDiscordSource(cfg discordConfig, input, pattern string) (discordCo
 		return cfg, errors.New("choose either -input or -pattern")
 	}
 	cfg.SourcePath, cfg.Pattern, cfg.SourceHash = input, pattern, ""
+	cfg.Source = nil
 	if input != "" {
 		// Wordlists may mix all supported Discord lengths; -length controls
 		// generated sources only, so it does not bind an input file's identity.
@@ -39,8 +41,19 @@ func configureDiscordSource(cfg discordConfig, input, pattern string) (discordCo
 			return cfg, err
 		}
 		cfg.SourceHash = wordlistHash(names)
+		cfg.Source = &nameSource{key: sourceKey{kind: "discord", alphabet: cfg.Alphabet, pattern: cfg.Pattern, hash: cfg.SourceHash, path: cfg.SourcePath, length: cfg.Length, seed: cfg.Seed}, words: names}
 	}
-	return cfg, validateDiscordSource(cfg)
+	if err := validateDiscordSource(cfg); err != nil {
+		return cfg, err
+	}
+	if cfg.Source == nil {
+		source, err := discordSource(cfg)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.Source = source
+	}
+	return cfg, nil
 }
 
 func validateDiscordSource(cfg discordConfig) error {
@@ -114,45 +127,9 @@ func readDiscordWordlist(path string) ([]string, error) {
 }
 
 func discordNames(cfg discordConfig) ([]string, error) {
-	if err := validateDiscordSource(cfg); err != nil {
+	source, err := discordSource(cfg)
+	if err != nil {
 		return nil, err
 	}
-	if cfg.SourcePath != "" {
-		names, err := readDiscordWordlist(cfg.SourcePath)
-		if err != nil {
-			return nil, err
-		}
-		if wordlistHash(names) != cfg.SourceHash {
-			return nil, errors.New("Discord wordlist changed; reuse its original contents or choose a new -out")
-		}
-		return names, nil
-	}
-	pattern := cfg.Pattern
-	if pattern == "" {
-		pattern = strings.Repeat("?", cfg.Length)
-	}
-	var positions []int
-	total := 1
-	for i := range pattern {
-		if pattern[i] == '?' {
-			positions = append(positions, i)
-			total *= len(cfg.Alphabet)
-		}
-	}
-	names := make([]string, 0, total)
-	for value := 0; value < total; value++ {
-		name, index := []byte(pattern), value
-		for i := len(positions) - 1; i >= 0; i-- {
-			name[positions[i]] = cfg.Alphabet[index%len(cfg.Alphabet)]
-			index /= len(cfg.Alphabet)
-		}
-		if validDiscordName(string(name)) {
-			names = append(names, string(name))
-		}
-	}
-	if len(names) == 0 {
-		return nil, errors.New("Discord source generates no valid names")
-	}
-	rand.New(rand.NewSource(cfg.Seed)).Shuffle(len(names), func(i, j int) { names[i], names[j] = names[j], names[i] })
-	return names, nil
+	return source.materialize(), nil
 }

@@ -61,13 +61,13 @@ go build -o hunt .
 | Default journal | `results.jsonl` | `discord-results.jsonl` |
 | Stdout | Candidates in discovery-only mode; verified available names with `-find`, `-live-verify`, or `-verify` | Names explicitly reported available |
 
-Both providers support ordered wordlists, `?` patterns, deterministic generation, `-digits`, `-n`, `-find`, `-fresh`, and separate `-out` files. `-n` limits new checks per invocation; `-n 0` selects all remaining names.
+Both providers support ordered wordlists, `?` patterns, deterministic generation, `-digits`, `-n`, `-find`, `-fresh`, `-wait`, and separate `-out` files. `-n` limits new checks in each search pass; a `-wait` retry can start another pass. `-n 0` selects all remaining names.
 
 Availability is a timestamped observation, not a reservation. An available name may not exist in your selected space. **Finder mode is the default:** it checks names without creating accounts or changing usernames. [GitHub renaming](#optional-github-rename) is a separate, explicit opt-in; Discord remains finder-only.
 
 ## GitHub
 
-Hunt groups up to **100 owner lookups per request**, covering personal and organization names. `-find` streams candidates into verification while discovery continues and cancels after the requested number of explicitly available names.
+Hunt groups **100 owner lookups per request by default**, covering personal and organization names. Opt into larger requests with `-batch 500` (the maximum); request starts remain serial and obey the same provider pacing. Larger batches can increase response latency, so the default remains 100. `-find` streams candidates into verification while discovery continues and cancels after the requested number of explicitly available names.
 
 ```sh
 # First five verified available names:
@@ -98,7 +98,11 @@ go run . -verify github-candidates.txt -verify-out verified.jsonl >> github-avai
 go run . -verify results.jsonl -verify-out verified.jsonl >> github-available.txt
 ```
 
-Discovery starts requests at least one second apart. A complete three-letter scan covers **17,576 combinations in 176 successful full-size requests**. Verification starts at least seven seconds apart and is usually the bottleneck for candidate-heavy searches. The signup validator is undocumented and may change; unknown responses stop verification while GraphQL discovery remains independent.
+Discovery starts requests at least one second apart. A complete three-letter scan covers **17,576 combinations in 176 successful requests at the default batch size of 100**. Verification starts at least seven seconds apart and is usually the bottleneck for candidate-heavy searches. With `-live-verify`, the verification backlog grows on demand up to the selected source size, so a slow validator does not impose a small fixed queue on discovery. `-find` keeps a small bounded backlog to stop promptly when its goal is reached.
+
+Generated sources retain shuffled integer positions and create each name when needed. Retries reuse that immutable order; patterns expand only their wildcards. Existing seeds and journal identities retain their order, and wordlist contents are revalidated before reuse.
+
+The signup validator is undocumented and may change. Unknown responses stop verification; `-wait` retries only recognized server cooldowns and exhausted temporary connection/server failures. Authentication, challenges, unexpected schemas, and persistence failures stop the command.
 
 ## Optional GitHub rename
 
@@ -111,7 +115,7 @@ go run . -platform github -n 0 -find 1 \
   -claim-cookies /path/to/private-export.json
 ```
 
-Add `-input github-names.txt` to search your own ordered list. Claim mode handles one three- or four-character name and rejects `-find` values above one, `-verify`, and `-live-verify`. All claim flags are GitHub-only and rejected with Discord.
+Add `-input github-names.txt` to search your own ordered list. Claim mode handles one three- or four-character name and rejects `-find` values above one, `-verify`, and `-live-verify`. It also rejects `-wait` and `-status-file`. All claim flags are GitHub-only and rejected with Discord.
 
 Supply your own **JSON or Netscape-format cookie export**. Keep it private and outside the repository; never commit or upload it. On macOS/Linux, the file must have `0600` permissions, for example `chmod 600 /path/to/private-export.json`. Hunt reads only that explicitly supplied file; it does not extract cookies from browser storage or use a GitHub CLI credential for renaming.
 
@@ -152,9 +156,22 @@ The availability endpoint is undocumented: `POST /api/v9/unique-username/usernam
 
 ## Stop and continue
 
-Press **Ctrl-C**, then repeat the same command to resume. Default journals are separate for each provider. Use `>>` to retain prior text output; JSONL journals hold the authoritative history, and cached available observations may be emitted again.
+Press **Ctrl-C**, then repeat the same command to resume. Default journals are separate for each provider. Use `>>` to retain prior text output; JSONL journals hold the authoritative history.
 
-Sources are bound to their journal: changing the wordlist contents, pattern, alphabet, length, or seed requires a new `-out` file. GitHub replays pending verification first. GitHub verification and Discord checks preserve request timing and rate cooldowns across restarts.
+To keep searching through known server cooldowns and temporary connection/server failures, enable search-only `-wait`:
+
+```sh
+go run . -length 3 -digits -n 0 -live-verify -wait >> github-available.txt
+go run . -platform discord -length 4 -digits -n 0 -wait >> discord-available.txt
+```
+
+`-wait` resumes completed checks after each pause, including observations whose short positive-cache lifetime has elapsed. GitHub discovery can wait through an API cooldown while verification drains saved candidates. Authentication failures, challenges, unknown responses, and journal failures still stop the search. `-wait` cannot be combined with `-fresh` or `-claim`.
+
+Verified available output has a durable publication acknowledgment. An available observation saved before an interrupted output write is replayed on resume. Regular-file stdout is synced before its acknowledgment is saved. A crash after output succeeds but before acknowledgment can still duplicate a line; consumers should deduplicate by platform and username. Pipes and terminals are acknowledged after their writer accepts the line, without promising delivery by downstream software.
+
+Sources are bound to their journal: changing the wordlist contents, pattern, alphabet, length, or seed requires a new `-out` file. GitHub replays pending verification first. Durable provider state coordinates request timing and server cooldowns across hunt processes, even when they use different result journals. GraphQL discovery, GitHub signup validation, and Discord eligibility have separate pacing state.
+
+By default, provider state lives under the operating system's user cache directory in `hunt/providers`. Set `HUNT_STATE_DIR` to choose a persistent directory; keep all hunt processes pointed at the same directory so they share pacing. Result journals also preserve timing checkpoints for migration and resume.
 
 Journals use exclusive operating-system locks. Process exit releases ownership automatically; leftover `.lock` files are harmless. Torn final writes after a valid record recover, while committed corruption and unrecognized files are rejected.
 
@@ -170,6 +187,20 @@ go run . -fresh -verify results.jsonl >> github-available.txt
 
 Progress goes to stderr. Use `-quiet` to hide progress, `-no-color` or `NO_COLOR` for plain text, and `-version` to print the build version. `go run . -help` lists every option.
 
+## Machine-readable progress
+
+`-status-file` optionally writes an atomic JSON snapshot once per second and at command completion:
+
+```sh
+go run . -n 0 -live-verify -wait -status-file github-status.json >> github-available.txt
+```
+
+The snapshot separates `discovery_checked`, `discovery_requests`, `verification_checked`, `verification_requests`, and `pending_verification`, with `source_total`, platform, PID, timestamps, and `state` (`running`, `complete`, `stopped`, or `failed`). Discord's direct availability requests use the verification stage. `last_progress_at` advances when a completion counter advances, while `updated_at` advances during idle waits too. A `running` snapshot may therefore represent a normal server cooldown.
+
+`discovery_checked` counts completed source positions, including loaded journal baselines. Its name rate counts newly completed positions during this invocation, so it can stay unchanged while `-fresh` rechecks previously completed names. Verification counters include loaded conclusive baselines and new observations; their name rate counts new conclusive observations during this invocation. `available` counts available observations, including saved baselines and new confirmations; repeated rechecks can add confirmations of the same name. All rates are invocation averages, and request counts include attempted network requests, including retries. These are display metrics, not a list of currently free names or an authoritative history; use the result journals for exact usernames and check times.
+
+Snapshots omit credentials, account session data, raw provider responses, and error messages. The file must differ from every input, result, verification, and cookie path. The containing directory must already exist. `-status-file` cannot be used with `-claim`. A later snapshot-write failure does not stop the search; an old `updated_at` can indicate stale display data.
+
 ## Measured GitHub performance
 
 A fixed live **GitHub-only** test checked the same 20 names with matching classifications:
@@ -180,6 +211,8 @@ A fixed live **GitHub-only** test checked the same 20 names with matching classi
 | One GraphQL batch | 1 | 0.77 s |
 
 These numbers do not describe Discord. They cover that GitHub workload and its deliberately paced baseline; no competing executable was benchmarked. See the [11-repository GitHub comparison](COMPARISON.md), [raw microbenchmarks](benchmark-results.txt), and [live test data](live-benchmark.json).
+
+For a generated four-character alphanumeric source of 1,679,616 names, local startup benchmarks on an Apple M5 measured median allocated bytes of **47,046,248 → 13,449,800** and startup time of **52.276 ms → 13.999 ms** for materialized versus indexed generation. This measures source construction with no network requests, not end-to-end search speed or peak resident memory. See [method and allocation details](COMPARISON.md#source-startup-and-journal-replay-v030).
 
 ## Development
 
@@ -192,7 +225,7 @@ go vet ./...
 go test -run '^$' -bench . -benchmem
 ```
 
-Builds target macOS, Linux, and Windows. CI tests those platforms and the minimum Go version. Tests cover provider isolation, explicit availability responses, cancellation, retries, source validation, refresh, journal recovery, cross-process locking, and resume. Optional rename tests use offline synthetic cookie and form fixtures only.
+Builds target macOS, Linux, and Windows. CI tests those platforms and the minimum Go version. Tests cover provider isolation, explicit availability responses, cancellation, retries, seeded source-order compatibility, refresh, journal recovery, cross-process locking and pacing, output replay, status snapshots, and resume. Optional rename tests use offline synthetic cookie and form fixtures only.
 
 `make build VERSION=<tag>` embeds a version in a compact binary. `make release VERSION=<tag>` creates six deterministic platform archives and a checksum manifest using Python's standard library. All implementation code was written independently.
 

@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -29,7 +31,7 @@ func finderTestBody(t *testing.T, owners ...any) string {
 	t.Helper()
 	data := map[string]any{"rateLimit": map[string]any{"remaining": 4000, "resetAt": time.Now().Add(time.Hour).UTC().Format(time.RFC3339), "cost": 1}}
 	for i, owner := range owners {
-		data["u"+string(rune('0'+i))] = owner
+		data["u"+strconv.Itoa(i)] = owner
 	}
 	encoded, err := json.Marshal(map[string]any{"data": data})
 	if err != nil {
@@ -43,6 +45,33 @@ func finderTestClient(transport finderTestTransport) *githubClient {
 		http:  &http.Client{Transport: transport},
 		token: "test-secret-token",
 		sleep: func(context.Context, time.Duration) error { return nil },
+	}
+}
+
+func TestLookupLargestBatchAndRejectOversizedBatch(t *testing.T) {
+	names := make([]string, maxLookupBatch)
+	owners := make([]any, len(names))
+	for i := range names {
+		names[i] = fmt.Sprintf("%03d", i)
+	}
+	calls := 0
+	client := finderTestClient(func(req *http.Request) (*http.Response, error) {
+		calls++
+		var payload struct{ Query string }
+		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Count(payload.Query, "repositoryOwner") != maxLookupBatch {
+			t.Fatal("largest batch did not use one query")
+		}
+		return finderTestResponse(200, finderTestBody(t, owners...), nil), nil
+	})
+	got, err := client.lookup(context.Background(), names)
+	if err != nil || len(got) != len(names) || calls != 1 {
+		t.Fatalf("largest batch: len=%d calls=%d err=%v", len(got), calls, err)
+	}
+	if _, err := client.lookup(context.Background(), append(names, "zzz")); err == nil || calls != 1 {
+		t.Fatalf("oversized batch reached transport: calls=%d err=%v", calls, err)
 	}
 }
 
@@ -161,6 +190,24 @@ func TestLookupTransientRetryPreservesExactQuery(t *testing.T) {
 	}
 	if len(got) != 2 || got[0].Name != "abc" || got[1].Name != "def" {
 		t.Fatalf("retry lost or reordered names: %#v", got)
+	}
+}
+
+func TestLookupServerChallengeStopsWithoutWaitRetry(t *testing.T) {
+	calls := 0
+	client := finderTestClient(func(*http.Request) (*http.Response, error) {
+		calls++
+		return finderTestResponse(http.StatusServiceUnavailable, `<html>Verify you are human</html>`, nil), nil
+	})
+	err := runSearchWithWaitClock(context.Background(), true, io.Discard, func() error {
+		_, err := client.lookup(context.Background(), []string{"abc"})
+		return err
+	}, time.Now, func(context.Context, time.Duration) error {
+		t.Fatal("challenge entered the wait retry loop")
+		return context.Canceled
+	})
+	if err == nil || calls != 1 {
+		t.Fatalf("challenge retried: calls=%d err=%v", calls, err)
 	}
 }
 

@@ -1,0 +1,27 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/guike8/hunt
+cpu: Apple M5
+BenchmarkGitHubSourceStartup/4Alnum/Indexed-10         	       1	  17356167 ns/op	13449800 B/op	      14 allocs/op
+BenchmarkGitHubSourceStartup/4Alnum/Indexed-10         	       1	  13998667 ns/op	13449800 B/op	      14 allocs/op
+BenchmarkGitHubSourceStartup/4Alnum/Indexed-10         	       1	  13584250 ns/op	13449800 B/op	      14 allocs/op
+BenchmarkGitHubSourceStartup/4Alnum/Materialized-10    	       1	  52275833 ns/op	47067528 B/op	 1679655 allocs/op
+BenchmarkGitHubSourceStartup/4Alnum/Materialized-10    	       1	  63831291 ns/op	47046248 B/op	 1679631 allocs/op
+BenchmarkGitHubSourceStartup/4Alnum/Materialized-10    	       1	  43469833 ns/op	47046232 B/op	 1679631 allocs/op
+BenchmarkGitHubSourceStartup/4Alnum/Cached-10          	       1	     10250 ns/op	    1112 B/op	       7 allocs/op
+BenchmarkGitHubSourceStartup/4Alnum/Cached-10          	       1	      3416 ns/op	    1112 B/op	       7 allocs/op
+BenchmarkGitHubSourceStartup/4Alnum/Cached-10          	       1	      3875 ns/op	    1112 B/op	       7 allocs/op
+BenchmarkGitHubSourceStartup/Pattern/Indexed-10        	       1	     39417 ns/op	   17576 B/op	      12 allocs/op
+BenchmarkGitHubSourceStartup/Pattern/Indexed-10        	       1	     35375 ns/op	   17576 B/op	      12 allocs/op
+BenchmarkGitHubSourceStartup/Pattern/Indexed-10        	       1	     31042 ns/op	   17576 B/op	      12 allocs/op
+BenchmarkGitHubSourceStartup/Pattern/Materialized-10   	       1	     66959 ns/op	   44520 B/op	    1309 allocs/op
+BenchmarkGitHubSourceStartup/Pattern/Materialized-10   	       1	     57167 ns/op	   44520 B/op	    1309 allocs/op
+BenchmarkGitHubSourceStartup/Pattern/Materialized-10   	       1	     71375 ns/op	   44520 B/op	    1309 allocs/op
+BenchmarkGitHubSourceStartup/Pattern/Cached-10         	       1	      3833 ns/op	    1112 B/op	       7 allocs/op
+BenchmarkGitHubSourceStartup/Pattern/Cached-10         	       1	      3625 ns/op	    1112 B/op	       7 allocs/op
+BenchmarkGitHubSourceStartup/Pattern/Cached-10         	       1	      3834 ns/op	    1112 B/op	       7 allocs/op
+BenchmarkStoreReplay100k-10                            	       1	 178345167 ns/op	66972080 B/op	 1100791 allocs/op
+BenchmarkStoreReplay100k-10                            	       1	 170028791 ns/op	66964256 B/op	 1100713 allocs/op
+BenchmarkStoreReplay100k-10                            	       1	 153770875 ns/op	66964000 B/op	 1100710 allocs/op
+PASS
+ok  	github.com/guike8/hunt	1.127s

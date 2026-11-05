@@ -25,13 +25,16 @@ type discordClient struct {
 	sleep         func(context.Context, time.Duration) error
 	beforeRequest func(time.Time) error
 	onCooldown    func(time.Time) error
+	gate          *providerGate
 }
 
 type discordSession struct {
-	file   *os.File
-	unlock func() error
-	client *discordClient
-	cache  map[string]verification
+	file        *os.File
+	unlock      func() error
+	client      *discordClient
+	cache       map[string]verification
+	generations map[string]uint64
+	published   map[string]uint64
 }
 
 type discordControl struct {
@@ -92,10 +95,17 @@ func (d *discordClient) check(ctx context.Context, name string) (verification, e
 		if err := ctx.Err(); err != nil {
 			return verification{}, err
 		}
-		if d.clock().Before(d.next) {
-			return verification{}, fmt.Errorf("Discord cooldown; do not retry before %s", d.next.UTC().Format(time.RFC3339Nano))
+		if d.gate == nil && d.clock().Before(d.next) {
+			return verification{}, cooldownFailure(d.next, "Discord cooldown")
 		}
-		if !d.last.IsZero() {
+		var lease *providerLease
+		if d.gate != nil {
+			var err error
+			lease, err = d.gate.Begin(ctx, d.last, d.next)
+			if err != nil {
+				return verification{}, err
+			}
+		} else if !d.last.IsZero() {
 			if delay := d.last.Add(d.interval).Sub(d.clock()); delay > 0 {
 				if err := d.sleep(ctx, delay); err != nil {
 					return verification{}, err
@@ -104,6 +114,7 @@ func (d *discordClient) check(ctx context.Context, name string) (verification, e
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, discordValidationURL, bytes.NewReader(body))
 		if err != nil {
+			closeSearchLease(lease)
 			return verification{}, err
 		}
 		req.Header.Set("Content-Type", "application/json")
@@ -112,39 +123,64 @@ func (d *discordClient) check(ctx context.Context, name string) (verification, e
 		d.last = d.clock()
 		if d.beforeRequest != nil {
 			if err := d.beforeRequest(d.last); err != nil {
+				closeSearchLease(lease)
 				return verification{}, fmt.Errorf("could not persist Discord request time: %w", err)
 			}
 		}
+		progressRequest(ctx, "verification")
 		response, err := httpClient.Do(req)
 		if err != nil {
+			if releaseErr := closeSearchLease(lease); releaseErr != nil {
+				return verification{}, releaseErr
+			}
 			if ctx.Err() != nil {
 				return verification{}, ctx.Err()
 			}
 			if attempt < 2 {
 				continue
 			}
-			return verification{}, errors.New("Discord connection failed after 3 attempts; availability unknown")
+			return verification{}, transientFailure("Discord connection attempts exhausted")
 		}
 		data, readErr := io.ReadAll(io.LimitReader(response.Body, 64*1024+1))
 		response.Body.Close()
 		remainingZero := strings.TrimSpace(response.Header.Get("X-RateLimit-Remaining")) == "0"
 		rateLimited := response.StatusCode == http.StatusTooManyRequests || response.Header.Get("Retry-After") != "" || remainingZero
 		if rateLimited {
-			if err := d.saveCooldown(discordCooldown(response.Header, data, d.clock())); err != nil {
+			until := discordCooldown(response.Header, data, d.clock())
+			if until.Before(d.next) {
+				until = d.next
+			}
+			if lease != nil {
+				if err := lease.Cooldown(until); err != nil {
+					closeSearchLease(lease)
+					return verification{}, err
+				}
+			}
+			if err := d.saveCooldown(until); err != nil {
+				closeSearchLease(lease)
 				return verification{}, err
 			}
 		}
+		if err := closeSearchLease(lease); err != nil {
+			return verification{}, err
+		}
 		if response.StatusCode == http.StatusTooManyRequests {
-			return verification{}, fmt.Errorf("Discord rate limited this request; do not retry before %s", d.next.UTC().Format(time.RFC3339Nano))
+			return verification{}, cooldownFailure(d.next, "Discord rate limit")
 		}
 		if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden || response.StatusCode == http.StatusNotFound {
 			return verification{}, fmt.Errorf("Discord HTTP %d; availability unknown; no authentication or account action attempted", response.StatusCode)
 		}
 		if response.StatusCode >= 500 && response.StatusCode <= 599 {
+			if searchChallengeResponse(data) {
+				return verification{}, errors.New("Discord returned a challenge; availability unknown; search stopped")
+			}
+			if rateLimited {
+				return verification{}, cooldownFailure(d.next, "Discord server response requested cooldown")
+			}
 			if !rateLimited && attempt < 2 {
 				continue
 			}
-			return verification{}, fmt.Errorf("Discord HTTP %d; availability unknown", response.StatusCode)
+			return verification{}, transientFailure("Discord server attempts exhausted")
 		}
 		if response.StatusCode == http.StatusBadRequest && readErr == nil && len(data) <= 64*1024 && discordInvalidName(data) {
 			return verification{Name: name, Status: "invalid", CheckedAt: d.clock().UTC(), Source: discordValidationURL}, nil
@@ -153,10 +189,13 @@ func (d *discordClient) check(ctx context.Context, name string) (verification, e
 			return verification{}, fmt.Errorf("unrecognized Discord response (HTTP %d); availability unknown", response.StatusCode)
 		}
 		if readErr != nil {
+			if rateLimited {
+				return verification{}, cooldownFailure(d.next, "Discord response requested cooldown")
+			}
 			if !rateLimited && attempt < 2 {
 				continue
 			}
-			return verification{}, errors.New("could not read Discord response; availability unknown")
+			return verification{}, transientFailure("Discord response reads exhausted")
 		}
 		if len(data) > 64*1024 {
 			return verification{}, errors.New("unexpectedly large Discord response; availability unknown")
@@ -249,7 +288,7 @@ func openDiscordSession(path string, cfg discordConfig) (*discordSession, error)
 		unlock()
 		return nil, err
 	}
-	s := &discordSession{file: file, unlock: unlock, cache: make(map[string]verification), client: &discordClient{http: &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, interval: time.Second}}
+	s := &discordSession{file: file, unlock: unlock, cache: make(map[string]verification), generations: make(map[string]uint64), published: make(map[string]uint64), client: &discordClient{http: &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, interval: time.Second}}
 	bound := persistentDiscordConfig(cfg)
 	lines := 0
 	if err := readJournal(file, func(line []byte, number int) error {
@@ -287,9 +326,20 @@ func openDiscordSession(path string, cfg discordConfig) (*discordSession, error)
 			if !validDiscordName(result.Name) || (result.Status != "available" && result.Status != "unavailable" && result.Status != "invalid") || result.CheckedAt.IsZero() || result.Source != discordValidationURL {
 				return fmt.Errorf("invalid Discord check at line %d", number)
 			}
+			generation := s.generations[result.Name] + 1
+			if generation == 0 || (result.Generation != 0 && result.Generation != generation) {
+				return fmt.Errorf("invalid Discord observation generation at line %d", number)
+			}
+			result.Generation = generation
+			s.generations[result.Name] = generation
 			// The last completed observation wins, even if the local clock was
 			// adjusted or two checks share the same timestamp.
 			s.cache[result.Name] = result
+		case "discord_published":
+			if !validDiscordName(entry.Name) || entry.Generation == 0 || entry.Generation != s.generations[entry.Name] || s.cache[entry.Name].Status != "available" {
+				return fmt.Errorf("invalid Discord publication acknowledgment at line %d", number)
+			}
+			s.published[entry.Name] = entry.Generation
 		default:
 			return fmt.Errorf("unexpected Discord journal record at line %d", number)
 		}
@@ -329,6 +379,13 @@ func (s *discordSession) cached(name string) (verification, bool) {
 	return result, age >= 0 && age < ttl
 }
 
+// recorded exposes the last durable observation for a resumable single pass.
+// Callers must not describe an expired positive observation as current.
+func (s *discordSession) recorded(name string) (verification, bool) {
+	result, found := s.cache[name]
+	return result, found
+}
+
 func (s *discordSession) check(ctx context.Context, name string, fresh bool) (verification, error) {
 	if err := ctx.Err(); err != nil {
 		return verification{}, err
@@ -345,6 +402,10 @@ func (s *discordSession) check(ctx context.Context, name string, fresh bool) (ve
 	if err != nil {
 		return verification{}, err
 	}
+	result.Generation = s.generations[name] + 1
+	if result.Generation == 0 {
+		return verification{}, errors.New("Discord observation generation overflow")
+	}
 	if err := s.write(struct {
 		Type string `json:"type"`
 		verification
@@ -352,7 +413,29 @@ func (s *discordSession) check(ctx context.Context, name string, fresh bool) (ve
 		return verification{}, err
 	}
 	s.cache[name] = result
+	s.generations[name] = result.Generation
+	progressVerified(ctx, result)
 	return result, nil
+}
+
+func (s *discordSession) needsPublish(name string) bool {
+	result, found := s.cache[name]
+	return found && result.Status == "available" && s.published[name] != result.Generation
+}
+
+func (s *discordSession) markPublished(result verification) error {
+	current, found := s.cache[result.Name]
+	if !found || current.Status != "available" || result.Status != "available" || result.Generation == 0 || result.Generation != current.Generation {
+		return errors.New("refusing Discord publication acknowledgment for an unknown or stale observation")
+	}
+	if s.published[result.Name] == result.Generation {
+		return nil
+	}
+	if err := s.write(publicationAck{Type: "discord_published", Name: result.Name, Generation: result.Generation}); err != nil {
+		return err
+	}
+	s.published[result.Name] = result.Generation
+	return nil
 }
 
 func (s *discordSession) write(value any) error {
