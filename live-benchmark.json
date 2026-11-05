@@ -1,0 +1,33 @@
+{
+  "baseline": "20 serial REST owner lookups, one-second start cadence",
+  "baseline_requests": 20,
+  "baseline_seconds": 19.232166375,
+  "batch": "same 20 names in one GraphQL query",
+  "batch_requests": 1,
+  "batch_seconds": 0.7727295,
+  "checked_at": "2026-11-05T18:10:35Z",
+  "classifications_agree": true,
+  "names": [
+    "aaa",
+    "aab",
+    "aac",
+    "aad",
+    "aae",
+    "aaf",
+    "aag",
+    "aah",
+    "aai",
+    "aaj",
+    "aak",
+    "aal",
+    "aam",
+    "aan",
+    "aao",
+    "aap",
+    "aaq",
+    "aar",
+    "aas",
+    "aat"
+  ],
+  "same_http_client": true
+}

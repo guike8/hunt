@@ -1,0 +1,12 @@
+/hunt
+/hunt.exe
+/bin/
+/dist/
+*.jsonl
+*.jsonl.lock
+/available*.txt
+/candidates*.txt
+/names.txt
+/.env
+/.env.*
+.DS_Store

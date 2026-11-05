@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="330" viewBox="0 0 1100 330" role="img" aria-labelledby="title description">
+  <title id="title">hunt terminal workflow</title>
+  <desc id="description">An illustrative workflow showing batched discovery, durable candidate queueing, careful verification, and safe resume. It is not a live availability result.</desc>
+  <rect x=".5" y=".5" width="1099" height="329" rx="15" fill="#0c1316" stroke="#2b3c3e"/>
+  <path d="M1 43H1099" stroke="#273638"/>
+  <g fill="#526963">
+    <circle cx="25" cy="22" r="4"/>
+    <circle cx="42" cy="22" r="4"/>
+    <circle cx="59" cy="22" r="4"/>
+  </g>
+  <text x="550" y="27" text-anchor="middle" fill="#829b90" font-family="monospace" font-size="12">hunt / illustrative workflow</text>
+  <g font-family="monospace" font-size="19">
+    <text x="35" y="88" fill="#c6ff77">$ <tspan fill="#eef3ea">hunt -n 0 -find 1</tspan></text>
+    <text x="35" y="137" fill="#6dcab5">discover <tspan x="170" fill="#acbdb4">100 names in one GraphQL request</tspan></text>
+    <text x="35" y="174" fill="#6dcab5">queue    <tspan x="170" fill="#acbdb4">save candidates before verification</tspan></text>
+    <text x="35" y="211" fill="#6dcab5">verify   <tspan x="170" fill="#acbdb4">accept exact, name-specific responses</tspan></text>
+    <text x="35" y="248" fill="#6dcab5">resume   <tspan x="170" fill="#acbdb4">restore progress, pacing, and cooldown</tspan></text>
+  </g>
+  <text x="35" y="301" fill="#71877c" font-family="monospace" font-size="12">Workflow illustration. No names shown or claimed; availability must be checked live.</text>
+</svg>

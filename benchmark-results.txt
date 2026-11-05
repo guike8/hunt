@@ -1,0 +1,18 @@
+goos: darwin
+goarch: arm64
+pkg: githubfinder
+cpu: Apple M5
+BenchmarkOwnerLookupBatches/batch_1-10         	     505	   1176294 ns/op	       100.0 requests/100names	  689618 B/op	    9102 allocs/op
+BenchmarkOwnerLookupBatches/batch_1-10         	     662	   1016656 ns/op	       100.0 requests/100names	  689577 B/op	    9102 allocs/op
+BenchmarkOwnerLookupBatches/batch_1-10         	    1141	    696501 ns/op	       100.0 requests/100names	  689567 B/op	    9102 allocs/op
+BenchmarkOwnerLookupBatches/batch_100-10       	    3196	    225108 ns/op	         1.000 requests/100names	   87311 B/op	    1113 allocs/op
+BenchmarkOwnerLookupBatches/batch_100-10       	    3189	    263066 ns/op	         1.000 requests/100names	   87342 B/op	    1113 allocs/op
+BenchmarkOwnerLookupBatches/batch_100-10       	    3157	    176163 ns/op	         1.000 requests/100names	   87320 B/op	    1113 allocs/op
+BenchmarkDurableJournalBatches/batch_false-10  	       2	 382937646 ns/op	   36168 B/op	     414 allocs/op
+BenchmarkDurableJournalBatches/batch_false-10  	       2	 382009688 ns/op	   36168 B/op	     414 allocs/op
+BenchmarkDurableJournalBatches/batch_false-10  	       2	 375883938 ns/op	   36164 B/op	     414 allocs/op
+BenchmarkDurableJournalBatches/batch_true-10   	     153	   4020189 ns/op	   31130 B/op	     110 allocs/op
+BenchmarkDurableJournalBatches/batch_true-10   	     148	   4040264 ns/op	   31138 B/op	     110 allocs/op
+BenchmarkDurableJournalBatches/batch_true-10   	     140	   4641856 ns/op	   31146 B/op	     110 allocs/op
+PASS
+ok  	githubfinder	13.478s
